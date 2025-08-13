@@ -18,15 +18,22 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"time"
 
 	"fmt"                                            // 引入 fmt 包
 	"github.com/prometheus/client_golang/prometheus" // 引入 prometheus 客户端
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics" // SDK 的 metrics 包
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 // PodMonitorReconciler reconciles a PodMonitor object
@@ -37,6 +44,7 @@ type PodMonitorReconciler struct {
 
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=pods/status,verbs=get
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -65,6 +73,32 @@ var (
 		},
 	)
 
+	// 证书过期时间监控指标
+	certificateExpirationTime = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pod_monitor_certificate_expiration_timestamp_seconds",
+			Help: "Unix timestamp in seconds indicating when the certificate will expire",
+		},
+		[]string{
+			"namespace",   // Secret 所在命名空间
+			"secret_name", // Secret 名称
+			"cert_type",   // 证书类型 (ca-cert, issuer-cert, etc.)
+		},
+	)
+
+	// 证书剩余有效天数
+	certificateDaysUntilExpiration = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pod_monitor_certificate_days_until_expiration",
+			Help: "Number of days until the certificate expires",
+		},
+		[]string{
+			"namespace",   // Secret 所在命名空间
+			"secret_name", // Secret 名称
+			"cert_type",   // 证书类型
+		},
+	)
+
 	// 用于存储我们已经观察到的容器重启次数，防止重复处理
 	// key: "namespace/podName/containerName", value: restartCount
 	// 注意：这是一个简单的内存存储，如果 Operator 重启，状态会丢失。
@@ -74,6 +108,8 @@ var (
 
 func init() {
 	metrics.Registry.MustRegister(podLastTerminationInfo)
+	metrics.Registry.MustRegister(certificateExpirationTime)
+	metrics.Registry.MustRegister(certificateDaysUntilExpiration)
 }
 
 //func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -85,7 +121,18 @@ func init() {
 //}
 
 func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// 使用您文件中已有的 logf 别名
+	// 判断是 Pod 还是 Secret 的事件
+	if req.Namespace == "linkerd" && req.Name == "linkerd-identity-issuer" {
+		// 处理 Secret 事件
+		return r.reconcileSecret(ctx, req)
+	}
+
+	// 处理 Pod 事件
+	return r.reconcilePod(ctx, req)
+}
+
+// reconcilePod 处理 Pod 相关的逻辑
+func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// 1. 获取 Pod 对象
@@ -134,10 +181,116 @@ func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{}, nil
 }
 
+// reconcileSecret 处理 Secret 相关的逻辑
+func (r *PodMonitorReconciler) reconcileSecret(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// 获取 Secret 对象
+	var secret corev1.Secret
+	if err := r.Get(ctx, req.NamespacedName, &secret); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			log.Error(err, "unable to fetch secret")
+			return ctrl.Result{}, err
+		}
+		// 如果 Secret 已被删除，清理相关指标
+		certificateExpirationTime.DeletePartialMatch(prometheus.Labels{
+			"namespace":   req.Namespace,
+			"secret_name": req.Name,
+		})
+		certificateDaysUntilExpiration.DeletePartialMatch(prometheus.Labels{
+			"namespace":   req.Namespace,
+			"secret_name": req.Name,
+		})
+		return ctrl.Result{}, nil
+	}
+
+	// 检查证书数据，支持 .crt 和 .pem 两种格式
+	for key, data := range secret.Data {
+		// Linkerd identity issuer secret 通常包含以下证书
+		// 支持 .crt 和 .pem 两种扩展名
+		// 注意：实际的 Linkerd 使用 crt.pem 作为证书文件名
+		if key == "ca.crt" || key == "issuer.crt" || key == "ca.pem" || key == "issuer.pem" || key == "crt.pem" {
+			if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, key, data); err != nil {
+				log.Error(err, "Failed to check certificate expiration", "key", key)
+			}
+		}
+	}
+
+	// 定期重新检查，每小时一次
+	return ctrl.Result{RequeueAfter: time.Hour}, nil
+}
+
+// parseCertificateFromPEM parses a PEM encoded certificate and returns the x509 certificate
+func parseCertificateFromPEM(pemData []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse PEM block")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return cert, nil
+}
+
+// checkCertificateExpiration checks the certificate expiration and updates metrics
+func (r *PodMonitorReconciler) checkCertificateExpiration(ctx context.Context, namespace, secretName, certType string, certData []byte) error {
+	log := logf.FromContext(ctx)
+
+	cert, err := parseCertificateFromPEM(certData)
+	if err != nil {
+		log.Error(err, "Failed to parse certificate", "namespace", namespace, "secret", secretName, "certType", certType)
+		return err
+	}
+
+	// Calculate expiration time and days until expiration
+	expirationTime := cert.NotAfter
+	now := time.Now()
+	daysUntilExpiration := expirationTime.Sub(now).Hours() / 24
+
+	log.Info("Certificate expiration info",
+		"namespace", namespace,
+		"secret", secretName,
+		"certType", certType,
+		"expirationTime", expirationTime,
+		"daysUntilExpiration", daysUntilExpiration)
+
+	// Update metrics
+	certificateExpirationTime.With(prometheus.Labels{
+		"namespace":   namespace,
+		"secret_name": secretName,
+		"cert_type":   certType,
+	}).Set(float64(expirationTime.Unix()))
+
+	certificateDaysUntilExpiration.With(prometheus.Labels{
+		"namespace":   namespace,
+		"secret_name": secretName,
+		"cert_type":   certType,
+	}).Set(daysUntilExpiration)
+
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PodMonitorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
+		// 也监听 Secret 资源，特别是 linkerd 命名空间下的
+		Watches(&corev1.Secret{}, &handler.EnqueueRequestForObject{},
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					// 只关注 linkerd 命名空间下的 linkerd-identity-issuer secret
+					return e.Object.GetNamespace() == "linkerd" && e.Object.GetName() == "linkerd-identity-issuer"
+				},
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					return e.ObjectNew.GetNamespace() == "linkerd" && e.ObjectNew.GetName() == "linkerd-identity-issuer"
+				},
+				DeleteFunc: func(e event.DeleteEvent) bool {
+					return false // 不关注删除事件
+				},
+			})).
 		Named("podmonitor").
 		Complete(r)
 }
