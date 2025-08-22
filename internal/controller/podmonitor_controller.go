@@ -29,13 +29,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics" // SDK 的 metrics 包
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 // PodMonitorReconciler reconciles a PodMonitor object
@@ -158,13 +155,14 @@ func init() {
 //}
 
 func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// 判断是 Pod 还是 Secret 的事件
-	if req.Namespace == "linkerd" && req.Name == "linkerd-identity-issuer" {
-		// 处理 Secret 事件
+	// 尝试获取 Secret
+	var secret corev1.Secret
+	if err := r.Get(ctx, req.NamespacedName, &secret); err == nil {
+		// 如果是 Secret，处理证书监控
 		return r.reconcileSecret(ctx, req)
 	}
 
-	// 处理 Pod 事件
+	// 否则处理 Pod 事件
 	return r.reconcilePod(ctx, req)
 }
 
@@ -292,14 +290,22 @@ func (r *PodMonitorReconciler) reconcileSecret(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	// 检查证书数据，支持 .crt 和 .pem 两种格式
-	for key, data := range secret.Data {
-		// Linkerd identity issuer secret 通常包含以下证书
-		// 支持 .crt 和 .pem 两种扩展名
-		// 注意：实际的 Linkerd 使用 crt.pem 作为证书文件名
-		if key == "ca.crt" || key == "issuer.crt" || key == "ca.pem" || key == "issuer.pem" || key == "crt.pem" {
-			if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, key, data); err != nil {
-				log.Error(err, "Failed to check certificate expiration", "key", key)
+	// 检查证书数据
+	// 优先检查 tls.crt（Kubernetes TLS Secret 的标准格式）
+	if tlsCrt, exists := secret.Data["tls.crt"]; exists {
+		if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, "tls.crt", tlsCrt); err != nil {
+			log.Error(err, "Failed to check certificate expiration", "key", "tls.crt")
+		}
+	} else {
+		// 如果没有 tls.crt，检查其他常见的证书文件
+		certificateKeys := []string{"crt.pem", "cert.pem", "ca.crt", "issuer.crt", "ca.pem", "issuer.pem"}
+		for _, key := range certificateKeys {
+			if data, exists := secret.Data[key]; exists {
+				if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, key, data); err != nil {
+					log.Error(err, "Failed to check certificate expiration", "key", key)
+				}
+				// 只处理找到的第一个证书文件
+				break
 			}
 		}
 	}
@@ -361,24 +367,13 @@ func (r *PodMonitorReconciler) checkCertificateExpiration(ctx context.Context, n
 	return nil
 }
 
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PodMonitorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
-		// 也监听 Secret 资源，特别是 linkerd 命名空间下的
-		Watches(&corev1.Secret{}, &handler.EnqueueRequestForObject{},
-			builder.WithPredicates(predicate.Funcs{
-				CreateFunc: func(e event.CreateEvent) bool {
-					// 只关注 linkerd 命名空间下的 linkerd-identity-issuer secret
-					return e.Object.GetNamespace() == "linkerd" && e.Object.GetName() == "linkerd-identity-issuer"
-				},
-				UpdateFunc: func(e event.UpdateEvent) bool {
-					return e.ObjectNew.GetNamespace() == "linkerd" && e.ObjectNew.GetName() == "linkerd-identity-issuer"
-				},
-				DeleteFunc: func(e event.DeleteEvent) bool {
-					return false // 不关注删除事件
-				},
-			})).
+		// 监听所有 Secret 对象
+		Watches(&corev1.Secret{}, &handler.EnqueueRequestForObject{}).
 		Named("podmonitor").
 		Complete(r)
 }
