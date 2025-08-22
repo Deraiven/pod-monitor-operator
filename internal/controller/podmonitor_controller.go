@@ -20,6 +20,8 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"strings"
+	"sync"
 	"time"
 
 	"fmt"                                            // 引入 fmt 包
@@ -134,6 +136,9 @@ var (
 	// 注意：这是一个简单的内存存储，如果 Operator 重启，状态会丢失。
 	// 生产环境可以考虑更持久化的方案。
 	observedRestarts = make(map[string]int32)
+
+	// 保护 observedRestarts map 的读写锁
+	restartsMutex sync.RWMutex
 )
 
 func init() {
@@ -174,14 +179,25 @@ func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Reques
 			log.Error(err, "unable to fetch Pod")
 			return ctrl.Result{}, err
 		}
-		// 如果 Pod 已被删除，清理相关指标
-		log.Info("Pod deleted, cleaning up metrics", "namespace", req.Namespace, "pod", req.Name)
+		// 如果 Pod 已被删除，清理相关指标和内存状态
+		log.Info("Pod deleted, cleaning up metrics and memory state", "namespace", req.Namespace, "pod", req.Name)
 
 		// 清理最后一次终止信息指标
 		podLastTerminationInfo.DeletePartialMatch(prometheus.Labels{
 			"namespace": req.Namespace,
 			"pod":       req.Name,
 		})
+
+		// 清理内存中的 observedRestarts 数据，防止内存泄漏
+		prefix := fmt.Sprintf("%s/%s/", req.Namespace, req.Name)
+		restartsMutex.Lock()
+		for key := range observedRestarts {
+			if strings.HasPrefix(key, prefix) {
+				delete(observedRestarts, key)
+				log.V(1).Info("Cleaned up restart state", "key", key)
+			}
+		}
+		restartsMutex.Unlock()
 
 		// 注意：不清理 podRestartTotal 和 podRestartEvents
 		// 因为这些是历史记录，应该保留
@@ -197,7 +213,13 @@ func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Reques
 		// 3. 检查重启条件
 		// 条件 1: 容器重启次数 > 我们已记录的次数
 		// 条件 2: 容器存在上一次终止的状态
-		if cs.RestartCount > observedRestarts[containerKey] && cs.LastTerminationState.Terminated != nil {
+
+		// 使用读锁检查当前记录的重启次数
+		restartsMutex.RLock()
+		observedCount := observedRestarts[containerKey]
+		restartsMutex.RUnlock()
+
+		if cs.RestartCount > observedCount && cs.LastTerminationState.Terminated != nil {
 			log.Info("Detected container restart", "pod", pod.Name, "container", cs.Name, "restartCount", cs.RestartCount)
 
 			// 4. 提取信息并更新 Prometheus 指标
@@ -238,7 +260,9 @@ func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Reques
 			}).Set(finishedAt)
 
 			// 5. 更新我们内存中记录的重启次数
+			restartsMutex.Lock()
 			observedRestarts[containerKey] = cs.RestartCount
+			restartsMutex.Unlock()
 		}
 	}
 
