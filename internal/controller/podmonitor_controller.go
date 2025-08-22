@@ -290,14 +290,22 @@ func (r *PodMonitorReconciler) reconcileSecret(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	// 检查证书数据，支持 .crt 和 .pem 两种格式
-	for key, data := range secret.Data {
-		// Linkerd identity issuer secret 通常包含以下证书
-		// 支持 .crt 和 .pem 两种扩展名
-		// 注意：实际的 Linkerd 使用 crt.pem 作为证书文件名
-		if key == "ca.crt" || key == "issuer.crt" || key == "ca.pem" || key == "issuer.pem" || key == "crt.pem" {
-			if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, key, data); err != nil {
-				log.Error(err, "Failed to check certificate expiration", "key", key)
+	// 检查证书数据
+	// 优先检查 tls.crt（Kubernetes TLS Secret 的标准格式）
+	if tlsCrt, exists := secret.Data["tls.crt"]; exists {
+		if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, "tls.crt", tlsCrt); err != nil {
+			log.Error(err, "Failed to check certificate expiration", "key", "tls.crt")
+		}
+	} else {
+		// 如果没有 tls.crt，检查其他常见的证书文件
+		certificateKeys := []string{"crt.pem", "cert.pem", "ca.crt", "issuer.crt", "ca.pem", "issuer.pem"}
+		for _, key := range certificateKeys {
+			if data, exists := secret.Data[key]; exists {
+				if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, key, data); err != nil {
+					log.Error(err, "Failed to check certificate expiration", "key", key)
+				}
+				// 只处理找到的第一个证书文件
+				break
 			}
 		}
 	}
