@@ -18,15 +18,24 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"strings"
+	"sync"
+	"time"
 
 	"fmt"                                            // 引入 fmt 包
 	"github.com/prometheus/client_golang/prometheus" // 引入 prometheus 客户端
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics" // SDK 的 metrics 包
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 // PodMonitorReconciler reconciles a PodMonitor object
@@ -37,6 +46,7 @@ type PodMonitorReconciler struct {
 
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=pods/status,verbs=get
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -65,15 +75,78 @@ var (
 		},
 	)
 
+	// 新增：Counter 用于统计总重启次数（持久化）
+	podRestartTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pod_monitor_container_restart_total",
+			Help: "Total number of container restarts",
+		},
+		[]string{
+			"namespace", // Pod 所在命名空间
+			"pod",       // Pod 名称
+			"container", // 容器名称
+			"reason",    // 终止原因
+		},
+	)
+
+	// 新增：基于事件的重启记录（每次重启创建独立记录）
+	podRestartEvents = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pod_monitor_container_restart_events",
+			Help: "Individual restart events with unique identifiers. Value is the termination timestamp.",
+		},
+		[]string{
+			"namespace",     // Pod 所在命名空间
+			"pod",           // Pod 名称
+			"container",     // 容器名称
+			"reason",        // 终止原因
+			"exit_code",     // 退出码
+			"restart_count", // 重启次数作为唯一标识符
+		},
+	)
+
+	// 证书过期时间监控指标
+	certificateExpirationTime = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pod_monitor_certificate_expiration_timestamp_seconds",
+			Help: "Unix timestamp in seconds indicating when the certificate will expire",
+		},
+		[]string{
+			"namespace",   // Secret 所在命名空间
+			"secret_name", // Secret 名称
+			"cert_type",   // 证书类型 (ca-cert, issuer-cert, etc.)
+		},
+	)
+
+	// 证书剩余有效天数
+	certificateDaysUntilExpiration = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pod_monitor_certificate_days_until_expiration",
+			Help: "Number of days until the certificate expires",
+		},
+		[]string{
+			"namespace",   // Secret 所在命名空间
+			"secret_name", // Secret 名称
+			"cert_type",   // 证书类型
+		},
+	)
+
 	// 用于存储我们已经观察到的容器重启次数，防止重复处理
 	// key: "namespace/podName/containerName", value: restartCount
 	// 注意：这是一个简单的内存存储，如果 Operator 重启，状态会丢失。
 	// 生产环境可以考虑更持久化的方案。
 	observedRestarts = make(map[string]int32)
+
+	// 保护 observedRestarts map 的读写锁
+	restartsMutex sync.RWMutex
 )
 
 func init() {
 	metrics.Registry.MustRegister(podLastTerminationInfo)
+	metrics.Registry.MustRegister(podRestartTotal)
+	metrics.Registry.MustRegister(podRestartEvents)
+	metrics.Registry.MustRegister(certificateExpirationTime)
+	metrics.Registry.MustRegister(certificateDaysUntilExpiration)
 }
 
 //func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -85,7 +158,18 @@ func init() {
 //}
 
 func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// 使用您文件中已有的 logf 别名
+	// 判断是 Pod 还是 Secret 的事件
+	if req.Namespace == "linkerd" && req.Name == "linkerd-identity-issuer" {
+		// 处理 Secret 事件
+		return r.reconcileSecret(ctx, req)
+	}
+
+	// 处理 Pod 事件
+	return r.reconcilePod(ctx, req)
+}
+
+// reconcilePod 处理 Pod 相关的逻辑
+func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// 1. 获取 Pod 对象
@@ -95,7 +179,29 @@ func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			log.Error(err, "unable to fetch Pod")
 			return ctrl.Result{}, err
 		}
-		// 如果 Pod 已被删除，则忽略
+		// 如果 Pod 已被删除，清理相关指标和内存状态
+		log.Info("Pod deleted, cleaning up metrics and memory state", "namespace", req.Namespace, "pod", req.Name)
+
+		// 清理最后一次终止信息指标
+		podLastTerminationInfo.DeletePartialMatch(prometheus.Labels{
+			"namespace": req.Namespace,
+			"pod":       req.Name,
+		})
+
+		// 清理内存中的 observedRestarts 数据，防止内存泄漏
+		prefix := fmt.Sprintf("%s/%s/", req.Namespace, req.Name)
+		restartsMutex.Lock()
+		for key := range observedRestarts {
+			if strings.HasPrefix(key, prefix) {
+				delete(observedRestarts, key)
+				log.V(1).Info("Cleaned up restart state", "key", key)
+			}
+		}
+		restartsMutex.Unlock()
+
+		// 注意：不清理 podRestartTotal 和 podRestartEvents
+		// 因为这些是历史记录，应该保留
+
 		return ctrl.Result{}, nil
 	}
 
@@ -107,17 +213,26 @@ func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// 3. 检查重启条件
 		// 条件 1: 容器重启次数 > 我们已记录的次数
 		// 条件 2: 容器存在上一次终止的状态
-		if cs.RestartCount > observedRestarts[containerKey] && cs.LastTerminationState.Terminated != nil {
+
+		// 使用读锁检查当前记录的重启次数
+		restartsMutex.RLock()
+		observedCount := observedRestarts[containerKey]
+		restartsMutex.RUnlock()
+
+		if cs.RestartCount > observedCount && cs.LastTerminationState.Terminated != nil {
 			log.Info("Detected container restart", "pod", pod.Name, "container", cs.Name, "restartCount", cs.RestartCount)
 
 			// 4. 提取信息并更新 Prometheus 指标
 			lastState := cs.LastTerminationState.Terminated
 			reason := lastState.Reason
+			if reason == "" {
+				reason = "Unknown"
+			}
 			exitCode := fmt.Sprintf("%d", lastState.ExitCode)
 			// 将完成时间转换为 Unix 时间戳 (float64)
 			finishedAt := float64(lastState.FinishedAt.Time.Unix())
 
-			// 使用提取的信息设置 Gauge 指标
+			// 4.1 更新最后一次终止信息（保持向后兼容）
 			podLastTerminationInfo.With(prometheus.Labels{
 				"namespace": pod.Namespace,
 				"pod":       pod.Name,
@@ -126,18 +241,144 @@ func (r *PodMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				"exit_code": exitCode,
 			}).Set(finishedAt)
 
+			// 4.2 增加重启计数器（持久化）
+			podRestartTotal.With(prometheus.Labels{
+				"namespace": pod.Namespace,
+				"pod":       pod.Name,
+				"container": cs.Name,
+				"reason":    reason,
+			}).Inc()
+
+			// 4.3 记录重启事件（每次重启创建独立记录）
+			podRestartEvents.With(prometheus.Labels{
+				"namespace":     pod.Namespace,
+				"pod":           pod.Name,
+				"container":     cs.Name,
+				"reason":        reason,
+				"exit_code":     exitCode,
+				"restart_count": fmt.Sprintf("%d", cs.RestartCount),
+			}).Set(finishedAt)
+
 			// 5. 更新我们内存中记录的重启次数
+			restartsMutex.Lock()
 			observedRestarts[containerKey] = cs.RestartCount
+			restartsMutex.Unlock()
 		}
 	}
 
 	return ctrl.Result{}, nil
 }
 
+// reconcileSecret 处理 Secret 相关的逻辑
+func (r *PodMonitorReconciler) reconcileSecret(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// 获取 Secret 对象
+	var secret corev1.Secret
+	if err := r.Get(ctx, req.NamespacedName, &secret); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			log.Error(err, "unable to fetch secret")
+			return ctrl.Result{}, err
+		}
+		// 如果 Secret 已被删除，清理相关指标
+		certificateExpirationTime.DeletePartialMatch(prometheus.Labels{
+			"namespace":   req.Namespace,
+			"secret_name": req.Name,
+		})
+		certificateDaysUntilExpiration.DeletePartialMatch(prometheus.Labels{
+			"namespace":   req.Namespace,
+			"secret_name": req.Name,
+		})
+		return ctrl.Result{}, nil
+	}
+
+	// 检查证书数据，支持 .crt 和 .pem 两种格式
+	for key, data := range secret.Data {
+		// Linkerd identity issuer secret 通常包含以下证书
+		// 支持 .crt 和 .pem 两种扩展名
+		// 注意：实际的 Linkerd 使用 crt.pem 作为证书文件名
+		if key == "ca.crt" || key == "issuer.crt" || key == "ca.pem" || key == "issuer.pem" || key == "crt.pem" {
+			if err := r.checkCertificateExpiration(ctx, req.Namespace, req.Name, key, data); err != nil {
+				log.Error(err, "Failed to check certificate expiration", "key", key)
+			}
+		}
+	}
+
+	// 定期重新检查，每小时一次
+	return ctrl.Result{RequeueAfter: time.Hour}, nil
+}
+
+// parseCertificateFromPEM parses a PEM encoded certificate and returns the x509 certificate
+func parseCertificateFromPEM(pemData []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse PEM block")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return cert, nil
+}
+
+// checkCertificateExpiration checks the certificate expiration and updates metrics
+func (r *PodMonitorReconciler) checkCertificateExpiration(ctx context.Context, namespace, secretName, certType string, certData []byte) error {
+	log := logf.FromContext(ctx)
+
+	cert, err := parseCertificateFromPEM(certData)
+	if err != nil {
+		log.Error(err, "Failed to parse certificate", "namespace", namespace, "secret", secretName, "certType", certType)
+		return err
+	}
+
+	// Calculate expiration time and days until expiration
+	expirationTime := cert.NotAfter
+	now := time.Now()
+	daysUntilExpiration := expirationTime.Sub(now).Hours() / 24
+
+	log.Info("Certificate expiration info",
+		"namespace", namespace,
+		"secret", secretName,
+		"certType", certType,
+		"expirationTime", expirationTime,
+		"daysUntilExpiration", daysUntilExpiration)
+
+	// Update metrics
+	certificateExpirationTime.With(prometheus.Labels{
+		"namespace":   namespace,
+		"secret_name": secretName,
+		"cert_type":   certType,
+	}).Set(float64(expirationTime.Unix()))
+
+	certificateDaysUntilExpiration.With(prometheus.Labels{
+		"namespace":   namespace,
+		"secret_name": secretName,
+		"cert_type":   certType,
+	}).Set(daysUntilExpiration)
+
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PodMonitorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
+		// 也监听 Secret 资源，特别是 linkerd 命名空间下的
+		Watches(&corev1.Secret{}, &handler.EnqueueRequestForObject{},
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					// 只关注 linkerd 命名空间下的 linkerd-identity-issuer secret
+					return e.Object.GetNamespace() == "linkerd" && e.Object.GetName() == "linkerd-identity-issuer"
+				},
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					return e.ObjectNew.GetNamespace() == "linkerd" && e.ObjectNew.GetName() == "linkerd-identity-issuer"
+				},
+				DeleteFunc: func(e event.DeleteEvent) bool {
+					return false // 不关注删除事件
+				},
+			})).
 		Named("podmonitor").
 		Complete(r)
 }

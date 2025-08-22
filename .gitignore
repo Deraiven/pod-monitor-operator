@@ -4,8 +4,8 @@
 *.dll
 *.so
 *.dylib
-bin/*
-Dockerfile.cross
+bin/
+testbin/
 
 # Test binary, built with `go test -c`
 *.test
@@ -16,12 +16,60 @@ Dockerfile.cross
 # Go workspace file
 go.work
 
-# Kubernetes Generated files - skip generated files, except for vendored files
-!vendor/**/zz_generated.*
+# Kubernetes
+*.yaml.back
+*.yaml~
 
-# editor and IDE paraphernalia
-.idea
-.vscode
+# env file
+.env
+
+# Mac OS
+.DS_Store
+
+# IDE specific files
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Build artifacts
+/bin/
+/build/
+/dist/
+
+# Dependency directories
+vendor/
+
+# kubebuilder
+/config/webhook/certmanager/
+*.bak
+
+# Test artifacts
+/test-output/
+/test-results/
+coverage.txt
+coverage.html
+
+# Local development
+kubeconfig
+.kubeconfig
+
+# Helm charts dependencies
+**/charts/*.tgz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local test certificates
+*.crt
+*.key
+*.pem
+!config/samples/test-linkerd-cert.yaml
