@@ -20,6 +20,8 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"strings"
+	"sync"
 	"time"
 
 	"fmt"                                            // 引入 fmt 包
@@ -73,6 +75,36 @@ var (
 		},
 	)
 
+	// 新增：Counter 用于统计总重启次数（持久化）
+	podRestartTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pod_monitor_container_restart_total",
+			Help: "Total number of container restarts",
+		},
+		[]string{
+			"namespace", // Pod 所在命名空间
+			"pod",       // Pod 名称
+			"container", // 容器名称
+			"reason",    // 终止原因
+		},
+	)
+
+	// 新增：基于事件的重启记录（每次重启创建独立记录）
+	podRestartEvents = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pod_monitor_container_restart_events",
+			Help: "Individual restart events with unique identifiers. Value is the termination timestamp.",
+		},
+		[]string{
+			"namespace",     // Pod 所在命名空间
+			"pod",           // Pod 名称
+			"container",     // 容器名称
+			"reason",        // 终止原因
+			"exit_code",     // 退出码
+			"restart_count", // 重启次数作为唯一标识符
+		},
+	)
+
 	// 证书过期时间监控指标
 	certificateExpirationTime = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -104,10 +136,15 @@ var (
 	// 注意：这是一个简单的内存存储，如果 Operator 重启，状态会丢失。
 	// 生产环境可以考虑更持久化的方案。
 	observedRestarts = make(map[string]int32)
+
+	// 保护 observedRestarts map 的读写锁
+	restartsMutex sync.RWMutex
 )
 
 func init() {
 	metrics.Registry.MustRegister(podLastTerminationInfo)
+	metrics.Registry.MustRegister(podRestartTotal)
+	metrics.Registry.MustRegister(podRestartEvents)
 	metrics.Registry.MustRegister(certificateExpirationTime)
 	metrics.Registry.MustRegister(certificateDaysUntilExpiration)
 }
@@ -142,7 +179,29 @@ func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Reques
 			log.Error(err, "unable to fetch Pod")
 			return ctrl.Result{}, err
 		}
-		// 如果 Pod 已被删除，则忽略
+		// 如果 Pod 已被删除，清理相关指标和内存状态
+		log.Info("Pod deleted, cleaning up metrics and memory state", "namespace", req.Namespace, "pod", req.Name)
+
+		// 清理最后一次终止信息指标
+		podLastTerminationInfo.DeletePartialMatch(prometheus.Labels{
+			"namespace": req.Namespace,
+			"pod":       req.Name,
+		})
+
+		// 清理内存中的 observedRestarts 数据，防止内存泄漏
+		prefix := fmt.Sprintf("%s/%s/", req.Namespace, req.Name)
+		restartsMutex.Lock()
+		for key := range observedRestarts {
+			if strings.HasPrefix(key, prefix) {
+				delete(observedRestarts, key)
+				log.V(1).Info("Cleaned up restart state", "key", key)
+			}
+		}
+		restartsMutex.Unlock()
+
+		// 注意：不清理 podRestartTotal 和 podRestartEvents
+		// 因为这些是历史记录，应该保留
+
 		return ctrl.Result{}, nil
 	}
 
@@ -154,17 +213,26 @@ func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Reques
 		// 3. 检查重启条件
 		// 条件 1: 容器重启次数 > 我们已记录的次数
 		// 条件 2: 容器存在上一次终止的状态
-		if cs.RestartCount > observedRestarts[containerKey] && cs.LastTerminationState.Terminated != nil {
+
+		// 使用读锁检查当前记录的重启次数
+		restartsMutex.RLock()
+		observedCount := observedRestarts[containerKey]
+		restartsMutex.RUnlock()
+
+		if cs.RestartCount > observedCount && cs.LastTerminationState.Terminated != nil {
 			log.Info("Detected container restart", "pod", pod.Name, "container", cs.Name, "restartCount", cs.RestartCount)
 
 			// 4. 提取信息并更新 Prometheus 指标
 			lastState := cs.LastTerminationState.Terminated
 			reason := lastState.Reason
+			if reason == "" {
+				reason = "Unknown"
+			}
 			exitCode := fmt.Sprintf("%d", lastState.ExitCode)
 			// 将完成时间转换为 Unix 时间戳 (float64)
 			finishedAt := float64(lastState.FinishedAt.Time.Unix())
 
-			// 使用提取的信息设置 Gauge 指标
+			// 4.1 更新最后一次终止信息（保持向后兼容）
 			podLastTerminationInfo.With(prometheus.Labels{
 				"namespace": pod.Namespace,
 				"pod":       pod.Name,
@@ -173,8 +241,28 @@ func (r *PodMonitorReconciler) reconcilePod(ctx context.Context, req ctrl.Reques
 				"exit_code": exitCode,
 			}).Set(finishedAt)
 
+			// 4.2 增加重启计数器（持久化）
+			podRestartTotal.With(prometheus.Labels{
+				"namespace": pod.Namespace,
+				"pod":       pod.Name,
+				"container": cs.Name,
+				"reason":    reason,
+			}).Inc()
+
+			// 4.3 记录重启事件（每次重启创建独立记录）
+			podRestartEvents.With(prometheus.Labels{
+				"namespace":     pod.Namespace,
+				"pod":           pod.Name,
+				"container":     cs.Name,
+				"reason":        reason,
+				"exit_code":     exitCode,
+				"restart_count": fmt.Sprintf("%d", cs.RestartCount),
+			}).Set(finishedAt)
+
 			// 5. 更新我们内存中记录的重启次数
+			restartsMutex.Lock()
 			observedRestarts[containerKey] = cs.RestartCount
+			restartsMutex.Unlock()
 		}
 	}
 
